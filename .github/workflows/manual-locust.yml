@@ -4,137 +4,56 @@ on:
   workflow_dispatch:
     inputs:
       users:
-        description: 'Number of concurrent users'
+        description: "Number of concurrent users"
         required: false
-        default: '10'
+        default: "10"
       spawn_rate:
-        description: 'Spawn rate (users/sec)'
+        description: "Spawn rate (users/sec)"
         required: false
-        default: '2'
+        default: "2"
       run_time:
-        description: 'Run time (e.g. 30s, 1m)'
+        description: "Run time (e.g. 30s, 1m)"
         required: false
-        default: '30s'
+        default: "30s"
 
 jobs:
   locust:
     runs-on: ubuntu-latest
+
     steps:
-      - name: Checkout repo
+      - name: Checkout repository
         uses: actions/checkout@v4
 
       - name: Setup Python
         uses: actions/setup-python@v4
         with:
-          python-version: '3.11'
+          python-version: "3.11"
 
-      - name: Install Locust
+      - name: Install dependencies
         run: |
           python -m pip install --upgrade pip
           pip install locust
 
-      - name: Write locustfile.py
-        run: |
-          cat > locustfile.py <<'PY'
-from locust import HttpUser, task, between, SequentialTaskSet
-import random
-import string
-import json
-
-def random_string(n=8):
-    return "".join(random.choices(string.ascii_lowercase + string.digits, k=n))
-
-class ApiTasks(SequentialTaskSet):
-    """
-    Example sequential user journey (optional). Tasks below run in sequence;
-    Locust will loop through them with the user's wait_time in between.
-    """
-
-    @task
-    def get_root(self):
-        # simple GET to /get (httpbin returns details about the request)
-        self.client.get("/get", name="GET /get")
-
-    @task
-    def get_with_query(self):
-        q = random_string(6)
-        self.client.get(f"/get?search={q}", name="GET /get?search")
-
-    @task
-    def head(self):
-        # HEAD returns headers only
-        self.client.head("/get", name="HEAD /get")
-
-    @task
-    def post_json(self):
-        payload = {"id": random.randint(1, 1000), "name": random_string(6)}
-        with self.client.post("/post", json=payload, name="POST /post", catch_response=True) as resp:
-            # simple validation example
-            if resp.status_code != 200:
-                resp.failure(f"Unexpected status {resp.status_code}")
-            else:
-                # optionally inspect returned json structure
-                try:
-                    data = resp.json()
-                    if "json" not in data:
-                        resp.failure("Response missing 'json' field")
-                except Exception:
-                    resp.failure("Invalid JSON in response")
-
-    @task
-    def put(self):
-        payload = {"update": random_string(10)}
-        self.client.put("/put", json=payload, name="PUT /put")
-
-    @task
-    def patch(self):
-        payload = {"patch": random_string(6)}
-        self.client.patch("/patch", json=payload, name="PATCH /patch")
-
-    @task
-    def delete(self):
-        self.client.delete("/delete", name="DELETE /delete")
-
-
-class HttpBinUser(HttpUser):
-    host = "https://httpbin.org"
-    tasks = [ApiTasks]   # use the SequentialTaskSet above
-    wait_time = between(1, 2)
-
-    def on_start(self):
-        # set a header for all requests from this virtual user
-        self.client.headers.update({"User-Agent": "LocustHttpBinTest/1.0"})
-PY
-
       - name: Run Locust (headless)
         id: run_locust
-        run: |
-          # run Locust headless; save stdout/stderr to locust.log and produce CSV prefixed with 'report'
-          locust -f locustfile.py --headless -u ${{ inputs.users }} -r ${{ inputs.spawn_rate }} --run-time ${{ inputs.run_time }} --csv=report 2>&1 | tee locust.log
-        # don't fail the job for Locust return code so we can always collect artifacts and summary
         continue-on-error: true
+        run: |
+          echo "Starting Locust: users=${{ inputs.users }} spawn_rate=${{ inputs.spawn_rate }} run_time=${{ inputs.run_time }}"
+          # Run locust headless, produce CSV files prefixed with "report" and save log
+          locust -f locustfile.py --headless -u ${{ inputs.users }} -r ${{ inputs.spawn_rate }} --run-time ${{ inputs.run_time }} --csv=report 2>&1 | tee locust.log
 
-      - name: Create summary from report_stats.csv (and add to run summary)
+      - name: Create brief summary (printed in logs)
         if: always()
         run: |
-          python - <<'PY'
-import csv, os, sys
-summary_path = os.environ.get('GITHUB_STEP_SUMMARY')
-csv_path = 'report_stats.csv'
-if not summary_path:
-    print("No GITHUB_STEP_SUMMARY available.")
-    sys.exit(0)
-if not os.path.exists(csv_path):
-    with open(summary_path,'a') as f:
-        f.write("**No report_stats.csv found.**\n\n")
-        f.write("Check the uploaded artifact `locust-report` for logs and CSVs.\n")
-    sys.exit(0)
-
-with open(csv_path, newline='') as f:
+          if [ -f report_stats.csv ]; then
+            echo "---- Locust CSV summary (top endpoints) ----"
+            python - <<'PY'
+import csv
+rows = []
+with open('report_stats.csv', newline='') as f:
     reader = csv.DictReader(f)
     rows = list(reader)
 
-# Sort top endpoints by Request Count
 def to_int(x):
     try:
         return int(x)
@@ -142,33 +61,20 @@ def to_int(x):
         return 0
 
 rows_sorted = sorted(rows, key=lambda r: to_int(r.get('Request Count','0')), reverse=True)
-top = rows_sorted[:10]
-
-table = "| Name | Requests | Failures | Median ms | Avg ms | Min ms | Max ms |\n"
-table += "|---|---:|---:|---:|---:|---:|---:|\n"
-for r in top:
-    table += "| {0} | {1} | {2} | {3} | {4} | {5} | {6} |\n".format(
-        r.get('Name',''),
-        r.get('Request Count',''),
-        r.get('Failure Count',''),
-        r.get('Median Response Time',''),
-        r.get('Average Response Time',''),
-        r.get('Min Response Time',''),
-        r.get('Max Response Time',''),
-    )
-
-# Total row if available
 total = next((r for r in rows if r.get('Name','').strip().lower()=='total'), None)
+if total:
+    print(f"TOTAL requests: {total.get('Request Count')}  failures: {total.get('Failure Count')}  avg_ms: {total.get('Average Response Time')}")
+else:
+    print("No 'Total' row in CSV")
 
-with open(summary_path, 'a') as f:
-    f.write("## Locust Run Summary\n\n")
-    if total:
-        f.write(f"- **Total requests:** {total.get('Request Count')}\n")
-        f.write(f"- **Total failures:** {total.get('Failure Count')}\n")
-        f.write(f"- **Avg response time (ms):** {total.get('Average Response Time')}\n\n")
-    f.write("### Top endpoints by requests\n\n")
-    f.write(table)
+print()
+print("Top endpoints:")
+for r in rows_sorted[:10]:
+    print(f"{r.get('Name','')}: requests={r.get('Request Count','')}, failures={r.get('Failure Count','')}, avg_ms={r.get('Average Response Time','')}")
 PY
+          else
+            echo "report_stats.csv not found; check locust.log for details"
+          fi
 
       - name: Upload artifacts (CSV + logs)
         if: always()
